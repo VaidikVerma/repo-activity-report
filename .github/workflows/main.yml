@@ -20,7 +20,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests pandas tabluate
+        run: pip install requests pandas tabulate
 
       - name: Run analysis script
         env:
