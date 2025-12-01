@@ -1,0 +1,144 @@
+name: ACR Tag Deletion (Old Tags)
+
+on:
+  workflow_dispatch:
+    inputs:
+      SubscriptionId:
+        description: "Azure Subscription ID"
+        required: true
+        default: "74d5756e-00ae-468e-ad4f-987e191acbbb"
+      RegistryName:
+        description: "Azure Container Registry Name"
+        required: true
+        default: "myacrregistry"
+      RepositoryName:
+        description: "Repository Name"
+        required: true
+        default: "myapp/myimage"
+      LastModifiedTime:
+        description: "Delete tags older than this date (ISO 8601 format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ)"
+        required: true
+        default: "2024-01-01"
+      JiraId:
+        description: "Request/Ticket ID"
+        required: true
+        default: "RITM-"
+
+jobs:
+  delete-old-tags:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Azure CLI login
+        run: |
+          az login --service-principal \
+            -u ${{ secrets.AZURE_CLIENT_ID }} \
+            -p ${{ secrets.AZURE_CLIENT_SECRET }} \
+            --tenant ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: Set subscription context
+        run: |
+          echo "Setting subscription context to ${{ github.event.inputs.SubscriptionId }}..."
+          az account set --subscription "${{ github.event.inputs.SubscriptionId }}"
+
+      - name: Create log directory
+        run: |
+          mkdir -p logs/ACRTagDeletion
+          echo "Log directory created at logs/ACRTagDeletion"
+
+      - name: Fetch and delete old tags
+        id: delete_tags
+        run: |
+          REGISTRY_NAME="${{ github.event.inputs.RegistryName }}"
+          REPO_NAME="${{ github.event.inputs.RepositoryName }}"
+          LAST_MODIFIED_TIME="${{ github.event.inputs.LastModifiedTime }}"
+          LOG_FILE="logs/ACRTagDeletion/${{ github.run_number }}-logsinfo.txt"
+          
+          echo "========================================" | tee -a "$LOG_FILE"
+          echo "ACR Tag Deletion Job Started" | tee -a "$LOG_FILE"
+          echo "Date: $(date)" | tee -a "$LOG_FILE"
+          echo "Workflow Run: ${{ github.run_number }}" | tee -a "$LOG_FILE"
+          echo "Triggered by: ${{ github.actor }}" | tee -a "$LOG_FILE"
+          echo "Jira ID: ${{ github.event.inputs.JiraId }}" | tee -a "$LOG_FILE"
+          echo "========================================" | tee -a "$LOG_FILE"
+          
+          echo "Fetching tags older than $LAST_MODIFIED_TIME..." | tee -a "$LOG_FILE"
+          
+          tags=$(az acr repository show-tags \
+            --name "$REGISTRY_NAME" \
+            --repository "$REPO_NAME" \
+            --orderby time_desc \
+            --detail \
+            --query "[?lastUpdateTime < '$LAST_MODIFIED_TIME'].{name:name, lastUpdateTime:lastUpdateTime}" \
+            --output tsv)
+          
+          if [ -z "$tags" ]; then
+            echo "No tags found older than $LAST_MODIFIED_TIME." | tee -a "$LOG_FILE"
+            echo "tags_deleted=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "" | tee -a "$LOG_FILE"
+          echo "Tags to be deleted:" | tee -a "$LOG_FILE"
+          while IFS=$'\t' read -r tag lastUpdateTime; do
+            echo "  - Tag: $tag | Last Modified: $lastUpdateTime" | tee -a "$LOG_FILE"
+          done <<< "$tags"
+          
+          echo "" | tee -a "$LOG_FILE"
+          echo "Starting deletion process..." | tee -a "$LOG_FILE"
+          
+          deleted_count=0
+          while IFS=$'\t' read -r tag lastUpdateTime; do
+            echo "Deleting tag: $tag (Last Modified: $lastUpdateTime)" | tee -a "$LOG_FILE"
+            
+            # Enable deletion for the tag
+            az acr repository update \
+              --name "$REGISTRY_NAME" \
+              --image "$REPO_NAME:$tag" \
+              --delete-enabled true \
+              --write-enabled true
+            
+            # Delete the tag
+            az acr repository delete \
+              --name "$REGISTRY_NAME" \
+              --image "$REPO_NAME:$tag" \
+              --yes
+            
+            echo "$(date) - Successfully deleted tag: $tag" | tee -a "$LOG_FILE"
+            ((deleted_count++))
+          done <<< "$tags"
+          
+          echo "" | tee -a "$LOG_FILE"
+          echo "========================================" | tee -a "$LOG_FILE"
+          echo "ACR Tag Deletion Completed Successfully" | tee -a "$LOG_FILE"
+          echo "Total tags deleted: $deleted_count" | tee -a "$LOG_FILE"
+          echo "========================================" | tee -a "$LOG_FILE"
+          
+          echo "tags_deleted=$deleted_count" >> $GITHUB_OUTPUT
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acr-tag-deletion-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## ACR Tag Deletion Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** ${{ github.event.inputs.RegistryName }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.event.inputs.RepositoryName }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Cutoff Date:** ${{ github.event.inputs.LastModifiedTime }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags Deleted:** ${{ steps.delete_tags.outputs.tags_deleted }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered By:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Jira ID:** ${{ github.event.inputs.JiraId }}" >> $GITHUB_STEP_SUMMARY
